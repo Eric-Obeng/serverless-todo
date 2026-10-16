@@ -182,6 +182,23 @@ In the GitHub repo settings:
 
 Every push to `main` then runs unit tests → frontend build → `sam validate --lint` → `sam build` → `sam deploy` → Amplify release job.
 
+### Branching
+
+`main` is protected: it only changes through pull requests, and only `main` deploys.
+
+```
+feature/<name> ──PR──▶ develop ──PR──▶ main ──▶ sam deploy + Amplify release
+```
+
+```bash
+git checkout develop && git pull
+git checkout -b feature/my-change
+# ...commit...
+git push -u origin feature/my-change      # open PR into develop
+```
+
+When `develop` is ready to release, open a PR `develop → main`. The `test` job must pass before it can merge.
+
 ### Local API (optional)
 
 ```bash

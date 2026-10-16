@@ -1,9 +1,13 @@
 name: SAM pipeline
 
+# Branch flow: feature/* -> PR -> develop -> PR -> main (protected).
+# Every push/PR to develop or main runs the `test` job (use it as the required
+# status check); only main deploys.
 on:
   push:
-    branches: [main]
+    branches: [main, develop]
   pull_request:
+    branches: [main, develop]
   workflow_dispatch:
 
 permissions:
@@ -48,7 +52,7 @@ jobs:
 
   deploy:
     needs: test
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     environment: dev
     permissions:
