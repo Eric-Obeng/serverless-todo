@@ -181,11 +181,22 @@ npm ci && npm run dev        # http://localhost:5173
 
 ### 3. Host the frontend on Amplify (all in SAM)
 
-Create a GitHub fine-grained PAT with read access to **Contents** and **Webhooks** on the repo. Store it once as a plain-text secret, which both environments use:
+Amplify needs a GitHub token to read the repo and register a webhook on it. Create a **classic** token at https://github.com/settings/tokens/new with the scopes **`repo`** and **`admin:repo_hook`**, and set the expiration past your review date. Store it once in the deploy region, which both environments use:
 
 ```bash
-aws secretsmanager create-secret --name serverless-todo/github-token --secret-string '<PAT>'
+aws secretsmanager create-secret --name serverless-todo/github-token \
+  --secret-string 'ghp_xxxxxxxxxxxxxxxxxxxx' --region eu-central-1
+# replacing an existing token:
+aws secretsmanager put-secret-value --secret-id serverless-todo/github-token \
+  --secret-string 'ghp_xxxxxxxxxxxxxxxxxxxx' --region eu-central-1
 ```
+
+- The secret must be **plain text**, the token alone. Key/value JSON (`{"token": ...}`) makes Amplify fail.
+- Check the stored token before deploying. This should print your GitHub login, not `"Bad credentials"`:
+  ```bash
+  curl -s -H "Authorization: Bearer $(aws secretsmanager get-secret-value --secret-id serverless-todo/github-token \
+    --query SecretString --output text --region eu-central-1)" https://api.github.com/user | grep -E '"login"|"message"'
+  ```
 
 When `FrontendRepositoryUrl` is set, each stack creates its own Amplify app connected to its own branch (`develop` or `main`). Amplify's auto-build is **off**. The pipeline starts a build after `sam deploy`, so the frontend always builds against the backend it was deployed with. After a manual deploy, start the build yourself:
 
