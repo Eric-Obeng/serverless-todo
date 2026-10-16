@@ -89,18 +89,24 @@ jobs:
         run: sam build
 
       - name: sam deploy
+        env:
+          ALARM_EMAIL: ${{ vars.ALARM_EMAIL }}
         run: |
+          PARAMS=(
+            "Stage=$STAGE"
+            "FrontendRepositoryUrl=${{ github.server_url }}/${{ github.repository }}"
+            "FrontendBranch=$BRANCH"
+          )
+          # SAM rejects empty values ("AlarmEmail="), so only pass it when set.
+          if [ -n "$ALARM_EMAIL" ]; then PARAMS+=("AlarmEmail=$ALARM_EMAIL"); fi
+
           sam deploy \
             --stack-name "$STACK_NAME" \
             --s3-prefix "$STACK_NAME" \
             --region "$AWS_REGION" \
             --no-confirm-changeset \
             --no-fail-on-empty-changeset \
-            --parameter-overrides \
-              Stage="$STAGE" \
-              FrontendRepositoryUrl="${{ github.server_url }}/${{ github.repository }}" \
-              FrontendBranch="$BRANCH" \
-              AlarmEmail="${{ vars.ALARM_EMAIL }}"
+            --parameter-overrides "${PARAMS[@]}"
 
       - name: Build frontend on Amplify (after backend, with its env vars)
         run: |
