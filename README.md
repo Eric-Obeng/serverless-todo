@@ -202,7 +202,7 @@ The template sets `VITE_USER_POOL_ID`, `VITE_USER_POOL_CLIENT_ID`, `VITE_API_URL
 After step 0, set up the GitHub repo:
 - **Secret** `AWS_DEPLOY_ROLE_ARN`: the `DeployRoleArn` output of `serverless-todo-bootstrap`
 - **Environments** (Settings → Environments): create `dev` and `prod`. For `prod`, you can add *Required reviewers* or limit *Deployment branches* to `main`.
-- **Optional variables:** `AWS_REGION` (default `us-east-1`), `ALARM_EMAIL`
+- **Optional variables:** `AWS_REGION` (default `eu-central-1`), `ALARM_EMAIL`
 
 Every push or PR to `develop` or `main` runs the unit tests, the frontend build and `sam validate --lint`. A merge then deploys that branch's environment: `sam build` → `sam deploy` → Amplify release job.
 

@@ -14,7 +14,7 @@ lint = true
 capabilities = "CAPABILITY_IAM"
 confirm_changeset = true
 resolve_s3 = true
-region = "us-east-1"
+region = "eu-central-1"
 s3_prefix = "serverless-todo-dev"
 # Add FrontendRepositoryUrl=https://github.com/<you>/<repo> to create the Amplify app.
 parameter_overrides = "Stage=dev"
@@ -29,6 +29,6 @@ stack_name = "serverless-todo-prod"
 capabilities = "CAPABILITY_IAM"
 confirm_changeset = false
 resolve_s3 = true
-region = "us-east-1"
+region = "eu-central-1"
 s3_prefix = "serverless-todo-prod"
 parameter_overrides = "Stage=prod"

@@ -20,7 +20,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  AWS_REGION: ${{ vars.AWS_REGION || 'eu-central-1' }}
 
 jobs:
   test:
@@ -38,7 +38,7 @@ jobs:
       - name: Frontend build check
         working-directory: frontend
         env:
-          VITE_AWS_REGION: us-east-1
+          VITE_AWS_REGION: eu-central-1
           VITE_USER_POOL_ID: ci
           VITE_USER_POOL_CLIENT_ID: ci
           VITE_API_URL: https://example.com
