@@ -450,6 +450,11 @@ Resources:
           POWERTOOLS_SERVICE_NAME: cancel-expiry
       Policies:
         - Statement:
+            # Read the task's current state so a late cancellation never deletes
+            # the schedule of a task that was reopened / rescheduled meanwhile.
+            - Effect: Allow
+              Action: dynamodb:GetItem
+              Resource: !GetAtt TasksTable.Arn
             - Effect: Allow
               Action: scheduler:DeleteSchedule
               Resource: !Sub arn:${AWS::Partition}:scheduler:${AWS::Region}:${AWS::AccountId}:schedule/${ExpiryScheduleGroup}/*
@@ -604,6 +609,7 @@ Resources:
                   ["ServerlessTodo", "TaskCreated", "service", "tasks-api"],
                   ["ServerlessTodo", "TaskExpired", "service", "expire-task"],
                   ["ServerlessTodo", "ExpiryCancelled", "service", "cancel-expiry"],
+                  ["ServerlessTodo", "ExpiryCancellationSkipped", "service", "cancel-expiry"],
                   ["ServerlessTodo", "UserSubscribed", "service", "post-authentication"]
                 ] } },
             { "type": "metric", "x": 0, "y": 6, "width": 12, "height": 6,
