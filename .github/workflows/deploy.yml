@@ -1,71 +1,35 @@
-name: SAM pipeline
+name: Deploy (reusable)
 
-# Branch flow: feature/* -> PR -> develop -> PR -> main (protected).
-# Every push/PR to develop or main runs the `test` job (use it as the required
-# status check). Merges deploy:
-#   develop -> stack serverless-todo-dev  (Stage=dev,  Amplify branch develop)
-#   main    -> stack serverless-todo-prod (Stage=prod, Amplify branch main)
+# Shared deploy steps, called by deploy-dev.yml and deploy-prod.yml so both
+# environments are deployed in exactly the same way.
 on:
-  push:
-    branches: [main, develop]
-  pull_request:
-    branches: [main, develop]
-  workflow_dispatch:
-
-permissions:
-  contents: read
-
-concurrency:
-  group: deploy-${{ github.ref }}
-  cancel-in-progress: false
-
-env:
-  AWS_REGION: ${{ vars.AWS_REGION || 'eu-central-1' }}
+  workflow_call:
+    inputs:
+      stage:
+        description: dev or prod
+        required: true
+        type: string
+      branch:
+        description: Git branch the stage's Amplify app builds from
+        required: true
+        type: string
+    secrets:
+      AWS_DEPLOY_ROLE_ARN:
+        required: true
 
 jobs:
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-      - name: Backend tests
-        working-directory: backend
-        run: |
-          npm ci
-          npm test
-      - name: Frontend build check
-        working-directory: frontend
-        env:
-          VITE_AWS_REGION: eu-central-1
-          VITE_USER_POOL_ID: ci
-          VITE_USER_POOL_CLIENT_ID: ci
-          VITE_API_URL: https://example.com
-        run: |
-          npm ci
-          npm run build
-      - uses: aws-actions/setup-sam@v2
-        with:
-          use-installer: true
-      - name: Validate template
-        run: sam validate --lint
-
   deploy:
-    needs: test
-    if: >-
-      (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop') &&
-      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     # GitHub environment per stage: add protection rules / env-specific vars there.
-    environment: ${{ github.ref_name == 'main' && 'prod' || 'dev' }}
-    env:
-      STAGE: ${{ github.ref_name == 'main' && 'prod' || 'dev' }}
-      STACK_NAME: serverless-todo-${{ github.ref_name == 'main' && 'prod' || 'dev' }}
-      BRANCH: ${{ github.ref_name }}
+    environment: ${{ inputs.stage }}
     permissions:
       id-token: write # GitHub OIDC -> AWS IAM role (see infra/bootstrap.yaml)
       contents: read
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION || 'eu-central-1' }}
+      STAGE: ${{ inputs.stage }}
+      STACK_NAME: serverless-todo-${{ inputs.stage }}
+      BRANCH: ${{ inputs.branch }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4

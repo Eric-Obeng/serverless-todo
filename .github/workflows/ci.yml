@@ -1,0 +1,41 @@
+name: CI
+
+# Tests and checks only - never touches AWS.
+# Runs on every PR into develop/main (job `test` is the required status check
+# for branch protection) and is reused by deploy-dev.yml / deploy-prod.yml.
+on:
+  pull_request:
+    branches: [main, develop]
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Backend tests
+        working-directory: backend
+        run: |
+          npm ci
+          npm test
+      - name: Frontend build check
+        working-directory: frontend
+        env:
+          VITE_AWS_REGION: eu-central-1
+          VITE_USER_POOL_ID: ci
+          VITE_USER_POOL_CLIENT_ID: ci
+          VITE_API_URL: https://example.com
+        run: |
+          npm ci
+          npm run build
+      - uses: aws-actions/setup-sam@v2
+        with:
+          use-installer: true
+      - name: Validate template
+        run: sam validate --lint

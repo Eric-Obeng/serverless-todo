@@ -20,7 +20,11 @@ A serverless task manager on AWS. Signed-in users manage their own tasks. Any ta
 ├── template.yaml                 # AWS SAM template: ALL infra incl. Amplify app
 ├── samconfig.toml                # sam build/deploy defaults (dev / prod)
 ├── amplify.yml                   # Amplify Hosting build spec (monorepo → frontend/)
-├── .github/workflows/pipeline.yml# test → sam validate → sam build → sam deploy → Amplify build
+├── .github/workflows/
+│   ├── ci.yml                    # PRs: tests, frontend build, sam validate (never touches AWS)
+│   ├── deploy-dev.yml            # push to develop → CI → deploy dev
+│   ├── deploy-prod.yml           # push to main    → CI → deploy prod
+│   └── deploy.yml                # shared deploy steps (sam build/deploy → Amplify build)
 ├── infra/bootstrap.yaml         # one-time per account: API GW logging role + GitHub OIDC deploy role
 ├── backend/
 │   ├── src/api/                  # Express app (CRUD) + Lambda adapter + local dev server
@@ -206,7 +210,15 @@ After step 0, set up the GitHub repo:
 - **Environments** (Settings → Environments): create `dev` and `prod`. For `prod`, you can add *Required reviewers* or limit *Deployment branches* to `main`.
 - **Optional variables:** `AWS_REGION` (default `eu-central-1`), `ALARM_EMAIL`
 
-Every push or PR to `develop` or `main` runs the unit tests, the frontend build and `sam validate --lint`. A merge then deploys that branch's environment: `sam build` → `sam deploy` → Amplify release job.
+Separate workflows for checking, dev and prod:
+
+| Workflow | Trigger | Steps |
+|---|---|---|
+| **CI** (`ci.yml`) | PR into `develop` or `main` | unit tests → frontend build → `sam validate --lint` |
+| **Deploy dev** (`deploy-dev.yml`) | push/merge to `develop`, or manual | CI → deploy `serverless-todo-dev` |
+| **Deploy prod** (`deploy-prod.yml`) | push/merge to `main`, or manual | CI → deploy `serverless-todo-prod` |
+
+Both deploy workflows call the same reusable `deploy.yml` (`sam build` → `sam deploy` → Amplify release job), so dev and prod are always deployed the same way. Each one only deploys from its own branch, including manual runs. To re-deploy without a new commit, open **Actions → Deploy dev / Deploy prod → Run workflow**.
 
 ### Branching
 
