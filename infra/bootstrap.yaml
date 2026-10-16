@@ -1,0 +1,97 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  One-time, account+region-level bootstrap shared by the dev and prod app stacks:
+  (1) API Gateway's CloudWatch Logs role (an account-wide setting), and
+  (2) the IAM role GitHub Actions assumes via OIDC to deploy.
+  aws cloudformation deploy --template-file infra/bootstrap.yaml \
+    --stack-name serverless-todo-bootstrap --capabilities CAPABILITY_NAMED_IAM \
+    --parameter-overrides GitHubOrg=<owner> GitHubRepo=<repo> GitHubOwnerId=<id> GitHubRepoId=<id>
+  Get the IDs with: curl -s https://api.github.com/repos/<owner>/<repo> | grep -E '"id"' | head -2
+  (first "id" = repo, the one inside "owner" = owner).
+
+Parameters:
+  GitHubOrg:
+    Type: String
+  GitHubRepo:
+    Type: String
+  # GitHub OIDC tokens may carry immutable IDs in the subject claim:
+  #   repo:<owner>@<ownerId>/<repo>@<repoId>:<ref-or-environment>
+  # Pinning the IDs means a renamed/re-created account or repo can't inherit the trust.
+  GitHubOwnerId:
+    Type: String
+    Default: ""
+    Description: Numeric GitHub owner (user/org) ID. Leave empty to match any ID for this owner name.
+  GitHubRepoId:
+    Type: String
+    Default: ""
+    Description: Numeric GitHub repository ID. Leave empty to match any ID for this repo name.
+  CreateOidcProvider:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Set to "false" if token.actions.githubusercontent.com already exists in the account.
+
+Conditions:
+  CreateProvider: !Equals [!Ref CreateOidcProvider, "true"]
+  HasGitHubIds: !And
+    - !Not [!Equals [!Ref GitHubOwnerId, ""]]
+    - !Not [!Equals [!Ref GitHubRepoId, ""]]
+
+Resources:
+  # API Gateway pushes execution/access logs using ONE role per account+region.
+  # Kept here (not in template.yaml) so deleting dev can never break prod logging.
+  ApiGatewayCloudWatchRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: apigateway.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs
+  ApiGatewayAccount:
+    Type: AWS::ApiGateway::Account
+    Properties:
+      CloudWatchRoleArn: !GetAtt ApiGatewayCloudWatchRole.Arn
+
+  GitHubOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Condition: CreateProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList: [sts.amazonaws.com]
+      ThumbprintList: [6938fd4d98bab03faadb97b34396831e3780aea1]
+
+  DeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: serverless-todo-github-deploy
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+              StringLike:
+                token.actions.githubusercontent.com:sub:
+                  # Legacy subject format (no IDs)
+                  - !Sub repo:${GitHubOrg}/${GitHubRepo}:*
+                  # Subject format with immutable IDs
+                  - !If
+                    - HasGitHubIds
+                    - !Sub repo:${GitHubOrg}@${GitHubOwnerId}/${GitHubRepo}@${GitHubRepoId}:*
+                    - !Sub repo:${GitHubOrg}@*/${GitHubRepo}@*:*
+      # Lab convenience. Tighten to the services in template.yaml for production.
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/AdministratorAccess
+
+Outputs:
+  DeployRoleArn:
+    Description: Save as the AWS_DEPLOY_ROLE_ARN GitHub secret
+    Value: !GetAtt DeployRole.Arn

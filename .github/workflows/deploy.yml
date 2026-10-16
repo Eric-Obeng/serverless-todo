@@ -1,0 +1,86 @@
+name: Deploy (reusable)
+
+# Shared deploy steps, called by deploy-dev.yml and deploy-prod.yml so both
+# environments are deployed in exactly the same way.
+on:
+  workflow_call:
+    inputs:
+      stage:
+        description: dev or prod
+        required: true
+        type: string
+      branch:
+        description: Git branch the stage's Amplify app builds from
+        required: true
+        type: string
+    secrets:
+      AWS_DEPLOY_ROLE_ARN:
+        required: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    # GitHub environment per stage: add protection rules / env-specific vars there.
+    environment: ${{ inputs.stage }}
+    permissions:
+      id-token: write # GitHub OIDC -> AWS IAM role (see infra/bootstrap.yaml)
+      contents: read
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION || 'eu-central-1' }}
+      STAGE: ${{ inputs.stage }}
+      STACK_NAME: serverless-todo-${{ inputs.stage }}
+      BRANCH: ${{ inputs.branch }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: aws-actions/setup-sam@v2
+        with:
+          use-installer: true
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install backend deps (esbuild)
+        working-directory: backend
+        run: |
+          npm ci
+          echo "$PWD/node_modules/.bin" >> "$GITHUB_PATH"   # sam build needs esbuild on PATH
+
+      - name: sam build
+        run: sam build
+
+      - name: sam deploy
+        env:
+          ALARM_EMAIL: ${{ vars.ALARM_EMAIL }}
+        run: |
+          PARAMS=(
+            "Stage=$STAGE"
+            "FrontendRepositoryUrl=${{ github.server_url }}/${{ github.repository }}"
+            "FrontendBranch=$BRANCH"
+          )
+          # SAM rejects empty values ("AlarmEmail="), so only pass it when set.
+          if [ -n "$ALARM_EMAIL" ]; then PARAMS+=("AlarmEmail=$ALARM_EMAIL"); fi
+
+          sam deploy \
+            --stack-name "$STACK_NAME" \
+            --s3-prefix "$STACK_NAME" \
+            --region "$AWS_REGION" \
+            --no-confirm-changeset \
+            --no-fail-on-empty-changeset \
+            --parameter-overrides "${PARAMS[@]}"
+
+      - name: Build frontend on Amplify (after backend, with its env vars)
+        run: |
+          APP_ID=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+            --query "Stacks[0].Outputs[?OutputKey=='AmplifyAppId'].OutputValue" --output text)
+          if [ -n "$APP_ID" ] && [ "$APP_ID" != "None" ]; then
+            aws amplify start-job --app-id "$APP_ID" --branch-name "$BRANCH" --job-type RELEASE
+          fi
+
+      - name: Stack outputs
+        run: |
+          aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+            --query "Stacks[0].Outputs" --output table
