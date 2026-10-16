@@ -1,0 +1,21 @@
+# Amplify Hosting build spec (monorepo). appRoot must match the
+# AMPLIFY_MONOREPO_APP_ROOT env var set on the Amplify app in template.yaml.
+version: 1
+applications:
+  - appRoot: frontend
+    frontend:
+      phases:
+        preBuild:
+          commands:
+            - npm ci
+        build:
+          commands:
+            # VITE_* env vars are injected by Amplify from the SAM stack
+            - npm run build
+      artifacts:
+        baseDirectory: dist
+        files:
+          - "**/*"
+      cache:
+        paths:
+          - node_modules/**/*

@@ -1,0 +1,103 @@
+name: SAM pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  STACK_NAME: ${{ vars.STACK_NAME || 'serverless-todo-dev' }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Backend tests
+        working-directory: backend
+        run: |
+          npm ci
+          npm test
+      - name: Frontend build check
+        working-directory: frontend
+        env:
+          VITE_AWS_REGION: us-east-1
+          VITE_USER_POOL_ID: ci
+          VITE_USER_POOL_CLIENT_ID: ci
+          VITE_API_URL: https://example.com
+        run: |
+          npm ci
+          npm run build
+      - uses: aws-actions/setup-sam@v2
+        with:
+          use-installer: true
+      - name: Validate template
+        run: sam validate --lint
+
+  deploy:
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    environment: dev
+    permissions:
+      id-token: write # GitHub OIDC -> AWS IAM role (see infra/github-oidc-role.yaml)
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: aws-actions/setup-sam@v2
+        with:
+          use-installer: true
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install backend deps (esbuild)
+        working-directory: backend
+        run: |
+          npm ci
+          echo "$PWD/node_modules/.bin" >> "$GITHUB_PATH"   # sam build needs esbuild on PATH
+
+      - name: sam build
+        run: sam build
+
+      - name: sam deploy
+        run: |
+          sam deploy \
+            --stack-name "$STACK_NAME" \
+            --region "$AWS_REGION" \
+            --no-confirm-changeset \
+            --no-fail-on-empty-changeset \
+            --parameter-overrides \
+              Stage=dev \
+              FrontendRepositoryUrl="${{ github.server_url }}/${{ github.repository }}" \
+              FrontendBranch=main \
+              AlarmEmail="${{ vars.ALARM_EMAIL }}"
+
+      - name: Trigger Amplify build (picks up latest env vars)
+        run: |
+          APP_ID=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+            --query "Stacks[0].Outputs[?OutputKey=='AmplifyAppId'].OutputValue" --output text)
+          if [ -n "$APP_ID" ] && [ "$APP_ID" != "None" ]; then
+            aws amplify start-job --app-id "$APP_ID" --branch-name main --job-type RELEASE
+          fi
+
+      - name: Stack outputs
+        run: |
+          aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+            --query "Stacks[0].Outputs" --output table

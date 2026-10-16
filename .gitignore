@@ -1,0 +1,9 @@
+node_modules/
+.aws-sam/
+dist/
+.env
+.env.local
+*.log
+.DS_Store
+docs/architecture/.venv/
+*.zip

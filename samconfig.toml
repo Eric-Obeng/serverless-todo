@@ -1,0 +1,34 @@
+version = 0.1
+
+[default.global.parameters]
+stack_name = "serverless-todo-dev"
+
+[default.build.parameters]
+cached = true
+parallel = true
+
+[default.validate.parameters]
+lint = true
+
+[default.deploy.parameters]
+capabilities = "CAPABILITY_IAM"
+confirm_changeset = true
+resolve_s3 = true
+region = "us-east-1"
+s3_prefix = "serverless-todo-dev"
+# Add FrontendRepositoryUrl=https://github.com/<you>/<repo> to create the Amplify app.
+parameter_overrides = "Stage=dev"
+
+[default.sync.parameters]
+watch = true
+
+[prod.global.parameters]
+stack_name = "serverless-todo-prod"
+
+[prod.deploy.parameters]
+capabilities = "CAPABILITY_IAM"
+confirm_changeset = false
+resolve_s3 = true
+region = "us-east-1"
+s3_prefix = "serverless-todo-prod"
+parameter_overrides = "Stage=prod"

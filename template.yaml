@@ -1,0 +1,700 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Serverless To-Do application with event-driven expiry processing.
+  Cognito + API Gateway (REST) + Lambda (Express) + DynamoDB (single table)
+  + EventBridge Scheduler + DynamoDB Streams + SQS FIFO + SNS + Amplify Hosting.
+
+# ---------------------------------------------------------------------------
+# Parameters
+# ---------------------------------------------------------------------------
+Parameters:
+  Stage:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, prod]
+    Description: Deployment stage (also used as API Gateway stage name).
+
+  DefaultDeadlineMinutes:
+    Type: Number
+    Default: 5
+    Description: Minutes after creation a task expires when no deadline is supplied.
+
+  FrontendRepositoryUrl:
+    Type: String
+    Default: ""
+    Description: >
+      HTTPS URL of the GitHub repo holding the React app (e.g. https://github.com/me/serverless-todo).
+      Leave empty to skip creating the Amplify app.
+
+  FrontendBranch:
+    Type: String
+    Default: main
+    Description: Branch Amplify builds from.
+
+  FrontendAppRoot:
+    Type: String
+    Default: frontend
+    Description: Folder of the React app inside the repo (monorepo app root). Use "." for a dedicated frontend repo.
+
+  GitHubTokenSecretName:
+    Type: String
+    Default: serverless-todo/github-token
+    Description: Secrets Manager secret (plain-text) holding a GitHub PAT that Amplify uses to pull the repo.
+
+  AlarmEmail:
+    Type: String
+    Default: ""
+    Description: Optional email address that receives CloudWatch alarm notifications.
+
+  LogRetentionDays:
+    Type: Number
+    Default: 14
+
+Conditions:
+  CreateFrontend: !Not [!Equals [!Ref FrontendRepositoryUrl, ""]]
+  HasAlarmEmail: !Not [!Equals [!Ref AlarmEmail, ""]]
+  IsProd: !Equals [!Ref Stage, prod]
+
+# ---------------------------------------------------------------------------
+# Globals
+# ---------------------------------------------------------------------------
+Globals:
+  Function:
+    Runtime: nodejs22.x
+    Architectures: [arm64]
+    MemorySize: 256
+    Timeout: 10
+    Tracing: Active
+    LoggingConfig:
+      LogFormat: JSON
+      ApplicationLogLevel: INFO
+      SystemLogLevel: WARN
+    Environment:
+      Variables:
+        NODE_OPTIONS: --enable-source-maps
+        TABLE_NAME: !Ref TasksTable
+        POWERTOOLS_METRICS_NAMESPACE: ServerlessTodo
+        STAGE: !Ref Stage
+
+# ---------------------------------------------------------------------------
+# Resources
+# ---------------------------------------------------------------------------
+Resources:
+  # ======================= Data ===========================================
+  # Single-table design:
+  #   PK = USER#<sub>          SK = TASK#<taskId>
+  #   GSI1PK = USER#<sub>      GSI1SK = STATUS#<status>#<deadlineISO>   (list tasks by status, ordered by deadline)
+  TasksTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub ${AWS::StackName}-tasks
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: PK, AttributeType: S }
+        - { AttributeName: SK, AttributeType: S }
+        - { AttributeName: GSI1PK, AttributeType: S }
+        - { AttributeName: GSI1SK, AttributeType: S }
+      KeySchema:
+        - { AttributeName: PK, KeyType: HASH }
+        - { AttributeName: SK, KeyType: RANGE }
+      GlobalSecondaryIndexes:
+        - IndexName: GSI1
+          KeySchema:
+            - { AttributeName: GSI1PK, KeyType: HASH }
+            - { AttributeName: GSI1SK, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+
+  # ======================= Messaging ======================================
+  TaskNotificationsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub ${AWS::StackName}-task-notifications
+      DisplayName: To-Do Notifications
+
+  # FIFO queue that decouples "task completed/deleted" stream events from schedule cancellation.
+  CancelExpiryDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${AWS::StackName}-cancel-expiry-dlq.fifo
+      FifoQueue: true
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+
+  CancelExpiryQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${AWS::StackName}-cancel-expiry.fifo
+      FifoQueue: true
+      ContentBasedDeduplication: false # we set an explicit dedup id (stream eventID)
+      VisibilityTimeout: 60
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt CancelExpiryDLQ.Arn
+        maxReceiveCount: 5
+
+  # Captures schedule invocations that fail after Scheduler retries.
+  ExpirySchedulerDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${AWS::StackName}-expiry-scheduler-dlq
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+
+  # ======================= Scheduling (EventBridge Scheduler) ==============
+  ExpiryScheduleGroup:
+    Type: AWS::Scheduler::ScheduleGroup
+    Properties:
+      Name: !Sub ${AWS::StackName}-task-expiry
+
+  # Role assumed by EventBridge Scheduler to invoke the expiry Lambda.
+  SchedulerInvokeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: scheduler.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: invoke-expiry-function
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource:
+                  - !GetAtt ExpireTaskFunction.Arn
+                  - !Sub ${ExpireTaskFunction.Arn}:*
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt ExpirySchedulerDLQ.Arn
+
+  # ======================= Auth (Cognito) =================================
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub ${AWS::StackName}-users
+      UsernameAttributes: [email]
+      UsernameConfiguration:
+        CaseSensitive: false
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Required: true
+          Mutable: true
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: true
+          RequireUppercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - { Name: verified_email, Priority: 1 }
+      # LambdaConfig (PreSignUp + PostAuthentication) is attached by the
+      # `Type: Cognito` events on the functions below.
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub ${AWS::StackName}-web
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      PreventUserExistenceErrors: ENABLED
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_USER_PASSWORD_AUTH # handy for CLI/curl testing
+        - ALLOW_REFRESH_TOKEN_AUTH
+      AccessTokenValidity: 60
+      IdTokenValidity: 60
+      RefreshTokenValidity: 30
+      TokenValidityUnits:
+        AccessToken: minutes
+        IdToken: minutes
+        RefreshToken: days
+
+  # Auto-confirms sign-ups (no verification code required).
+  PreSignUpFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties: { Minify: true, Target: es2022, Sourcemap: true, EntryPoints: [src/functions/preSignUp.js] }
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-pre-signup
+      CodeUri: backend/
+      Handler: preSignUp.handler
+      Description: Cognito PreSignUp trigger - auto-confirms users and verifies email
+      Events:
+        CognitoPreSignUp:
+          Type: Cognito
+          Properties:
+            UserPool: !Ref UserPool
+            Trigger: PreSignUp
+
+  # Subscribes the user's email to the SNS topic (with a userId filter policy).
+  PostAuthenticationFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties: { Minify: true, Target: es2022, Sourcemap: true, EntryPoints: [src/functions/postAuthentication.js] }
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-post-authentication
+      CodeUri: backend/
+      Handler: postAuthentication.handler
+      Description: Cognito PostAuthentication trigger - subscribes user email to SNS
+      Environment:
+        Variables:
+          TOPIC_ARN: !Ref TaskNotificationsTopic
+          POWERTOOLS_SERVICE_NAME: post-authentication
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: [sns:Subscribe, sns:ListSubscriptionsByTopic]
+              Resource: !Ref TaskNotificationsTopic
+      Events:
+        CognitoPostAuth:
+          Type: Cognito
+          Properties:
+            UserPool: !Ref UserPool
+            Trigger: PostAuthentication
+
+  # ======================= API ============================================
+  TasksApi:
+    Type: AWS::Serverless::Api
+    DependsOn: [ApiGatewayAccount]
+    Properties:
+      Name: !Sub ${AWS::StackName}-api
+      StageName: !Ref Stage
+      TracingEnabled: true
+      Cors:
+        AllowOrigin: "'*'"
+        AllowHeaders: "'Content-Type,Authorization'"
+        AllowMethods: "'GET,POST,PUT,DELETE,OPTIONS'"
+      Auth:
+        DefaultAuthorizer: CognitoAuthorizer
+        AddDefaultAuthorizerToCorsPreflight: false
+        Authorizers:
+          CognitoAuthorizer:
+            UserPoolArn: !GetAtt UserPool.Arn
+            Identity:
+              Header: Authorization
+      GatewayResponses:
+        DEFAULT_4XX:
+          ResponseParameters:
+            Headers:
+              Access-Control-Allow-Origin: "'*'"
+              Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+        DEFAULT_5XX:
+          ResponseParameters:
+            Headers:
+              Access-Control-Allow-Origin: "'*'"
+              Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+      MethodSettings:
+        - ResourcePath: "/*"
+          HttpMethod: "*"
+          MetricsEnabled: true
+          LoggingLevel: INFO
+          DataTraceEnabled: false
+          ThrottlingBurstLimit: 50
+          ThrottlingRateLimit: 100
+      AccessLogSetting:
+        DestinationArn: !GetAtt ApiAccessLogGroup.Arn
+        Format: >-
+          {"requestId":"$context.requestId","ip":"$context.identity.sourceIp","user":"$context.authorizer.claims.sub",
+          "requestTime":"$context.requestTime","method":"$context.httpMethod","path":"$context.resourcePath",
+          "status":"$context.status","latency":"$context.responseLatency","integrationError":"$context.integrationErrorMessage"}
+
+  # CRUD API: a single Express app running in Lambda behind a proxy integration.
+  ApiFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties: { Minify: true, Target: es2022, Sourcemap: true, EntryPoints: [src/api/handler.js] }
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-api
+      CodeUri: backend/
+      Handler: handler.handler
+      Description: Express CRUD API for tasks
+      MemorySize: 512
+      Environment:
+        Variables:
+          POWERTOOLS_SERVICE_NAME: tasks-api
+          DEFAULT_DEADLINE_MINUTES: !Ref DefaultDeadlineMinutes
+          SCHEDULE_GROUP_NAME: !Ref ExpiryScheduleGroup
+          EXPIRY_FUNCTION_ARN: !GetAtt ExpireTaskFunction.Arn
+          SCHEDULER_ROLE_ARN: !GetAtt SchedulerInvokeRole.Arn
+          SCHEDULER_DLQ_ARN: !GetAtt ExpirySchedulerDLQ.Arn
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:DeleteItem, dynamodb:Query]
+              Resource:
+                - !GetAtt TasksTable.Arn
+                - !Sub ${TasksTable.Arn}/index/GSI1
+            - Effect: Allow
+              Action: [scheduler:CreateSchedule, scheduler:UpdateSchedule]
+              Resource: !Sub arn:${AWS::Partition}:scheduler:${AWS::Region}:${AWS::AccountId}:schedule/${ExpiryScheduleGroup}/*
+            - Effect: Allow
+              Action: iam:PassRole
+              Resource: !GetAtt SchedulerInvokeRole.Arn
+              Condition:
+                StringEquals:
+                  iam:PassedToService: scheduler.amazonaws.com
+      Events:
+        TasksRoot:
+          Type: Api
+          Properties:
+            RestApiId: !Ref TasksApi
+            Path: /tasks
+            Method: ANY
+        TasksProxy:
+          Type: Api
+          Properties:
+            RestApiId: !Ref TasksApi
+            Path: /tasks/{proxy+}
+            Method: ANY
+
+  # ======================= Expiry workflow ================================
+  # Invoked by EventBridge Scheduler at the task deadline.
+  ExpireTaskFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties: { Minify: true, Target: es2022, Sourcemap: true, EntryPoints: [src/functions/expireTask.js] }
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-expire-task
+      CodeUri: backend/
+      Handler: expireTask.handler
+      Description: Marks a Pending task as Expired and notifies the owner via SNS
+      Environment:
+        Variables:
+          TOPIC_ARN: !Ref TaskNotificationsTopic
+          POWERTOOLS_SERVICE_NAME: expire-task
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:UpdateItem]
+              Resource: !GetAtt TasksTable.Arn
+            - Effect: Allow
+              Action: sns:Publish
+              Resource: !Ref TaskNotificationsTopic
+
+  # ======================= Cancellation workflow ==========================
+  # DynamoDB Stream -> (this Lambda) -> SQS FIFO
+  StreamRouterFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties: { Minify: true, Target: es2022, Sourcemap: true, EntryPoints: [src/functions/streamRouter.js] }
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-stream-router
+      CodeUri: backend/
+      Handler: streamRouter.handler
+      Description: Routes completed/deleted task stream events to the cancel-expiry FIFO queue
+      Environment:
+        Variables:
+          CANCEL_QUEUE_URL: !Ref CancelExpiryQueue
+          POWERTOOLS_SERVICE_NAME: stream-router
+      Policies:
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt CancelExpiryQueue.QueueName
+      Events:
+        TaskStream:
+          Type: DynamoDB
+          Properties:
+            Stream: !GetAtt TasksTable.StreamArn
+            StartingPosition: LATEST
+            BatchSize: 25
+            MaximumRetryAttempts: 5
+            BisectBatchOnFunctionError: true
+            FunctionResponseTypes: [ReportBatchItemFailures]
+            FilterCriteria:
+              Filters:
+                # Task deleted while still Pending
+                - Pattern: '{"eventName":["REMOVE"],"dynamodb":{"OldImage":{"status":{"S":["Pending"]}}}}'
+                # Task moved Pending -> Completed
+                - Pattern: '{"eventName":["MODIFY"],"dynamodb":{"OldImage":{"status":{"S":["Pending"]}},"NewImage":{"status":{"S":["Completed"]}}}}'
+
+  # SQS FIFO -> (this Lambda) -> delete EventBridge schedule (idempotent)
+  CancelExpiryFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties: { Minify: true, Target: es2022, Sourcemap: true, EntryPoints: [src/functions/cancelExpiry.js] }
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-cancel-expiry
+      CodeUri: backend/
+      Handler: cancelExpiry.handler
+      Description: Deletes the scheduled expiry event for completed/deleted tasks
+      Environment:
+        Variables:
+          SCHEDULE_GROUP_NAME: !Ref ExpiryScheduleGroup
+          POWERTOOLS_SERVICE_NAME: cancel-expiry
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: scheduler:DeleteSchedule
+              Resource: !Sub arn:${AWS::Partition}:scheduler:${AWS::Region}:${AWS::AccountId}:schedule/${ExpiryScheduleGroup}/*
+      Events:
+        CancelQueue:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt CancelExpiryQueue.Arn
+            BatchSize: 10
+            FunctionResponseTypes: [ReportBatchItemFailures]
+
+  # ======================= Observability ==================================
+  ApiAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/apigateway/${AWS::StackName}-access
+      RetentionInDays: !Ref LogRetentionDays
+
+  PreSignUpLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${PreSignUpFunction}
+      RetentionInDays: !Ref LogRetentionDays
+  PostAuthenticationLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${PostAuthenticationFunction}
+      RetentionInDays: !Ref LogRetentionDays
+  ApiFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${ApiFunction}
+      RetentionInDays: !Ref LogRetentionDays
+  ExpireTaskLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${ExpireTaskFunction}
+      RetentionInDays: !Ref LogRetentionDays
+  StreamRouterLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${StreamRouterFunction}
+      RetentionInDays: !Ref LogRetentionDays
+  CancelExpiryLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${CancelExpiryFunction}
+      RetentionInDays: !Ref LogRetentionDays
+
+  # API Gateway needs an account-level (per region) role to push execution/access logs to CloudWatch.
+  ApiGatewayCloudWatchRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: apigateway.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs
+  ApiGatewayAccount:
+    Type: AWS::ApiGateway::Account
+    Properties:
+      CloudWatchRoleArn: !GetAtt ApiGatewayCloudWatchRole.Arn
+
+  OpsAlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub ${AWS::StackName}-ops-alarms
+  OpsAlarmSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlarmEmail
+    Properties:
+      TopicArn: !Ref OpsAlarmTopic
+      Protocol: email
+      Endpoint: !Ref AlarmEmail
+
+  ApiFunctionErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Tasks API Lambda errors
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions: [{ Name: FunctionName, Value: !Ref ApiFunction }]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref OpsAlarmTopic]
+  ExpireTaskErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Expiry Lambda errors
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions: [{ Name: FunctionName, Value: !Ref ExpireTaskFunction }]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref OpsAlarmTopic]
+  CancelExpiryDLQAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Messages landed in the cancel-expiry DLQ
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions: [{ Name: QueueName, Value: !GetAtt CancelExpiryDLQ.QueueName }]
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref OpsAlarmTopic]
+  ExpirySchedulerDLQAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Failed scheduled expiry invocations
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions: [{ Name: QueueName, Value: !GetAtt ExpirySchedulerDLQ.QueueName }]
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref OpsAlarmTopic]
+  Api5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: API Gateway 5XX responses
+      Namespace: AWS/ApiGateway
+      MetricName: 5XXError
+      Dimensions:
+        - { Name: ApiName, Value: !Sub "${AWS::StackName}-api" }
+        - { Name: Stage, Value: !Ref Stage }
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref OpsAlarmTopic]
+
+  Dashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub ${AWS::StackName}
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            { "type": "metric", "x": 0, "y": 0, "width": 12, "height": 6,
+              "properties": { "title": "API Gateway", "region": "${AWS::Region}", "stat": "Sum", "period": 60,
+                "metrics": [
+                  ["AWS/ApiGateway", "Count", "ApiName", "${AWS::StackName}-api", "Stage", "${Stage}"],
+                  [".", "4XXError", ".", ".", ".", "."],
+                  [".", "5XXError", ".", ".", ".", "."]
+                ] } },
+            { "type": "metric", "x": 12, "y": 0, "width": 12, "height": 6,
+              "properties": { "title": "Task lifecycle (custom metrics)", "region": "${AWS::Region}", "stat": "Sum", "period": 60,
+                "metrics": [
+                  ["ServerlessTodo", "TaskCreated", "service", "tasks-api"],
+                  ["ServerlessTodo", "TaskExpired", "service", "expire-task"],
+                  ["ServerlessTodo", "ExpiryCancelled", "service", "cancel-expiry"],
+                  ["ServerlessTodo", "UserSubscribed", "service", "post-authentication"]
+                ] } },
+            { "type": "metric", "x": 0, "y": 6, "width": 12, "height": 6,
+              "properties": { "title": "Lambda errors", "region": "${AWS::Region}", "stat": "Sum", "period": 60,
+                "metrics": [
+                  ["AWS/Lambda", "Errors", "FunctionName", "${ApiFunction}"],
+                  ["...", "${ExpireTaskFunction}"],
+                  ["...", "${StreamRouterFunction}"],
+                  ["...", "${CancelExpiryFunction}"],
+                  ["...", "${PostAuthenticationFunction}"]
+                ] } },
+            { "type": "metric", "x": 12, "y": 6, "width": 12, "height": 6,
+              "properties": { "title": "Queues", "region": "${AWS::Region}", "stat": "Maximum", "period": 60,
+                "metrics": [
+                  ["AWS/SQS", "ApproximateNumberOfMessagesVisible", "QueueName", "${CancelExpiryQueue.QueueName}"],
+                  ["...", "${CancelExpiryDLQ.QueueName}"],
+                  ["...", "${ExpirySchedulerDLQ.QueueName}"]
+                ] } }
+          ]
+        }
+
+  # ======================= Frontend (Amplify Hosting) =====================
+  AmplifyApp:
+    Type: AWS::Amplify::App
+    Condition: CreateFrontend
+    Properties:
+      Name: !Sub ${AWS::StackName}-web
+      Platform: WEB
+      Repository: !Ref FrontendRepositoryUrl
+      AccessToken: !Sub "{{resolve:secretsmanager:${GitHubTokenSecretName}}}"
+      # Build spec lives in amplify.yml at the repo root.
+      EnvironmentVariables:
+        - { Name: AMPLIFY_MONOREPO_APP_ROOT, Value: !Ref FrontendAppRoot }
+        - { Name: VITE_AWS_REGION, Value: !Ref AWS::Region }
+        - { Name: VITE_USER_POOL_ID, Value: !Ref UserPool }
+        - { Name: VITE_USER_POOL_CLIENT_ID, Value: !Ref UserPoolClient }
+        - { Name: VITE_API_URL, Value: !Sub "https://${TasksApi}.execute-api.${AWS::Region}.amazonaws.com/${Stage}" }
+      CustomRules:
+        # SPA fallback: serve index.html for client-side routes
+        - Source: </^[^.]+$|\.(?!(css|gif|ico|jpg|js|png|txt|svg|woff|woff2|ttf|map|json|webp)$)([^.]+$)/>
+          Target: /index.html
+          Status: "200"
+
+  AmplifyBranch:
+    Type: AWS::Amplify::Branch
+    Condition: CreateFrontend
+    Properties:
+      AppId: !GetAtt AmplifyApp.AppId
+      BranchName: !Ref FrontendBranch
+      EnableAutoBuild: true
+      Stage: !If [IsProd, PRODUCTION, DEVELOPMENT]
+
+# ---------------------------------------------------------------------------
+# Outputs
+# ---------------------------------------------------------------------------
+Outputs:
+  ApiUrl:
+    Description: Base URL of the REST API
+    Value: !Sub https://${TasksApi}.execute-api.${AWS::Region}.amazonaws.com/${Stage}
+  UserPoolId:
+    Value: !Ref UserPool
+  UserPoolClientId:
+    Value: !Ref UserPoolClient
+  Region:
+    Value: !Ref AWS::Region
+  TasksTableName:
+    Value: !Ref TasksTable
+  TaskNotificationsTopicArn:
+    Value: !Ref TaskNotificationsTopic
+  CancelExpiryQueueUrl:
+    Value: !Ref CancelExpiryQueue
+  ScheduleGroupName:
+    Value: !Ref ExpiryScheduleGroup
+  DashboardUrl:
+    Value: !Sub https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${AWS::StackName}
+  AmplifyAppId:
+    Condition: CreateFrontend
+    Value: !GetAtt AmplifyApp.AppId
+  AmplifyAppUrl:
+    Condition: CreateFrontend
+    Value: !Sub https://${FrontendBranch}.${AmplifyApp.DefaultDomain}
