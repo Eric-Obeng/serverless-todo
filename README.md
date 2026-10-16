@@ -47,37 +47,45 @@ A serverless task manager on AWS. Signed-in users manage their own tasks. Any ta
 
 ## Architecture
 
-```mermaid
-flowchart LR
-  U[User / Browser] -->|HTTPS| AMP[Amplify Hosting<br/>React SPA]
-  U -->|Sign up / Sign in| COG[Cognito User Pool]
-  COG -->|PreSignUp| PRE[λ PreSignUp<br/>auto-confirm]
-  COG -->|PostAuthentication| POST[λ PostAuth]
-  POST -->|Subscribe email<br/>FilterPolicy userId| SNS[(SNS Topic)]
-
-  U -->|REST + ID token| APIGW[API Gateway REST<br/>Cognito authorizer]
-  APIGW --> API[λ Tasks API<br/>Express]
-  API -->|CRUD| DDB[(DynamoDB<br/>single table)]
-  API -->|CreateSchedule at deadline| SCH[EventBridge Scheduler]
-
-  SCH -->|at deadline| EXP[λ ExpireTask]
-  SCH -. failed .-> SDLQ[[Scheduler DLQ]]
-  EXP -->|Pending→Expired<br/>conditional update| DDB
-  EXP -->|Publish userId attr| SNS
-  SNS -->|email| INBOX[User inbox]
-
-  DDB -->|Stream: REMOVE / Pending→Completed| RT[λ StreamRouter]
-  RT -->|GroupId=taskId<br/>DedupId=eventID| FIFO[[SQS FIFO<br/>cancel-expiry.fifo]]
-  FIFO --> CAN[λ CancelExpiry]
-  FIFO -. 5 failures .-> FDLQ[[FIFO DLQ]]
-  CAN -->|DeleteSchedule| SCH
-
-  API & EXP & RT & CAN & POST -.-> CW[CloudWatch<br/>Logs · Metrics · Alarms · Dashboard]
-```
-
 ![Architecture](docs/architecture/architecture.png)
 
-To regenerate the AWS-icon diagram above (diagram-as-code), run:
+The diagram is generated from code, [`docs/architecture/diagram.py`](docs/architecture/diagram.py). The numbers and letters on its arrows match the walkthrough below. Dev and prod are two identical, isolated copies of the "per-environment stack" in the account's `eu-central-1` region.
+
+**Request path (blue)**
+
+| # | Step |
+|---|---|
+| ① | The browser loads the React SPA from **Amplify Hosting**. The SPA's Cognito and API settings come from `VITE_*` env vars that SAM sets on the Amplify app. |
+| ② | The user signs up or signs in against the **Cognito User Pool** (email + password). The **PreSignUp** Lambda auto-confirms new users. |
+| ③ | After sign-in, the **PostAuthentication** Lambda subscribes the user's email to the **SNS** topic with the filter policy `{"userId": ["<sub>"]}`. |
+| ④ | The SPA calls **API Gateway (REST)** with the Cognito ID token. The Cognito authorizer verifies the JWT before any Lambda runs. |
+| ⑤ | The **Tasks API** Lambda (Express) does the CRUD in **DynamoDB**. The user ID always comes from the verified token. |
+| ⑥ | On create, and on a deadline change or reopen, the API creates or updates a one-time **EventBridge Scheduler** schedule `task-<id>` at the deadline (default: now + 5 min). |
+
+**Expiry (orange)**
+
+| # | Step |
+|---|---|
+| ⑦ | At the deadline, Scheduler invokes **ExpireTask** with `{taskId, userId}`. Retries are built in, and failures go to the Scheduler DLQ. |
+| ⑧ | A conditional update changes `Pending → Expired`. It's a no-op if the task was completed, deleted or already expired, so duplicates and races are safe. |
+| ⑨ | ExpireTask publishes to SNS with the message attribute `userId`. |
+| ⑩ | The subscription filter policy delivers the email to the task owner only. |
+
+**Cancellation (orange; decoupled and idempotent)**
+
+| # | Step |
+|---|---|
+| Ⓐ | Completing a Pending task, or deleting it, writes a **DynamoDB Stream** record. The event source mapping filters the stream to exactly those two changes. |
+| Ⓑ | **StreamRouter** sends a message to **SQS FIFO**: `MessageGroupId = taskId` (ordered per task), `MessageDeduplicationId = stream eventID` (stream retries can't create duplicates). |
+| Ⓒ | **CancelExpiry** consumes the queue with partial batch failures. After 5 failed attempts a message goes to the FIFO DLQ. |
+| Ⓓ | It re-reads the task (consistent read). If the task is **Pending again** (reopened or rescheduled before the cancellation ran), it keeps the schedule. |
+| Ⓔ | Otherwise it deletes the schedule. "Not found" counts as success, which makes cancellation idempotent. |
+
+**Delivery (grey dashed):** PRs run **CI**. A merge to `develop` or `main` runs **Deploy dev** or **Deploy prod**, which log in to AWS through **GitHub OIDC** (no stored keys) and run `sam deploy`. CloudFormation then provisions the stack and the Amplify build. The **bootstrap stack** holds the account-level pieces: the OIDC deploy role, API Gateway's CloudWatch role and the GitHub token for Amplify.
+
+**Observability (green dotted):** all Lambdas and API Gateway send JSON logs, custom metrics and X-Ray traces to **CloudWatch**, which also has a dashboard and alarms (Lambda errors, API 5XX, both DLQs).
+
+To regenerate the diagram:
 
 ```bash
 pip install diagrams && sudo apt install graphviz   # or: brew install graphviz
@@ -113,19 +121,6 @@ All routes need `Authorization: <Cognito ID token>`.
 | POST | `/tasks` | `{ title, description?, date?, deadline? }` |
 | PUT | `/tasks/{taskId}` | any of `{ title, description, date, deadline, status: Pending\|Completed }` |
 | DELETE | `/tasks/{taskId}` | |
-
-### How the event-driven parts work
-
-**Expiry**
-1. `POST /tasks` writes the item, then creates a one-time EventBridge Scheduler schedule `task-<id>` set to `at(deadline)`, with `ActionAfterCompletion: DELETE` and a DLQ.
-2. At the deadline, Scheduler invokes **ExpireTask** with `{ taskId, userId }`.
-3. ExpireTask runs a **conditional** update (`status = Pending AND deadline = <read value>`) to set `Expired`. Retries, duplicates and a race with "complete" are all no-ops.
-4. It then publishes to SNS with the message attribute `userId`. Each user's email subscription has the filter policy `{"userId":["<sub>"]}`, so only the owner gets the email.
-
-**Cancellation (decoupled + idempotent)**
-1. Completing (`Pending → Completed`) or deleting a Pending task emits a DynamoDB Stream record.
-2. The event source mapping **filters** the stream down to exactly those two shapes. **StreamRouter** checks the record again and sends it to **SQS FIFO** with `MessageGroupId = taskId` (ordered per task) and `MessageDeduplicationId = stream eventID`, so stream retries can't create duplicates.
-3. **CancelExpiry** deletes the schedule. A `ResourceNotFound` counts as success (the schedule already fired, was already cancelled, or this is a duplicate), which makes the step idempotent. Failures use partial batch responses, and after 5 tries a message moves to the FIFO DLQ, which has an alarm.
 
 ## Getting started
 
