@@ -148,8 +148,10 @@ Users, tasks and SNS subscriptions don't carry over between environments. Sign u
 ```bash
 aws cloudformation deploy --template-file infra/bootstrap.yaml \
   --stack-name serverless-todo-bootstrap --capabilities CAPABILITY_NAMED_IAM \
-  --parameter-overrides GitHubOrg=<owner> GitHubRepo=<repo>
+  --parameter-overrides GitHubOrg=<owner> GitHubRepo=<repo> GitHubOwnerId=<id> GitHubRepoId=<id>
 ```
+
+GitHub's login token identifies the repo as `repo:<owner>@<ownerId>/<repo>@<repoId>:...`. Pinning the numeric IDs means a renamed or re-created account can't take over the deploy role. To get them, run `curl -s https://api.github.com/repos/<owner>/<repo>`: the top-level `id` is the repo's, and `owner.id` is the owner's. Add `CreateOidcProvider=false` if the account already has the GitHub provider.
 
 > **Upgrading a dev stack created before this file existed:** that stack created its own API Gateway logging role. Deploy the bootstrap stack **first**, then update dev. Dev then removes its old copy, and the account setting already points at the bootstrap role.
 
