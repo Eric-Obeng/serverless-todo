@@ -361,11 +361,13 @@ Resources:
             RestApiId: !Ref TasksApi
             Path: /tasks
             Method: ANY
-        TasksProxy:
+        # Explicit path param (not {proxy+}): serverless-express would otherwise
+        # route on pathParameters.proxy and drop the /tasks prefix.
+        TaskById:
           Type: Api
           Properties:
             RestApiId: !Ref TasksApi
-            Path: /tasks/{proxy+}
+            Path: /tasks/{taskId}
             Method: ANY
 
   # ======================= Expiry workflow ================================
