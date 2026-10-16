@@ -275,7 +275,9 @@ Resources:
   # ======================= API ============================================
   TasksApi:
     Type: AWS::Serverless::Api
-    DependsOn: [ApiGatewayAccount]
+    # Execution/access logging needs API Gateway's account-level CloudWatch role.
+    # It is shared by every stack in the account+region, so it lives in
+    # infra/bootstrap.yaml (deploy that once, before any app stack).
     Properties:
       Name: !Sub ${AWS::StackName}-api
       StageName: !Ref Stage
@@ -497,23 +499,6 @@ Resources:
       LogGroupName: !Sub /aws/lambda/${CancelExpiryFunction}
       RetentionInDays: !Ref LogRetentionDays
 
-  # API Gateway needs an account-level (per region) role to push execution/access logs to CloudWatch.
-  ApiGatewayCloudWatchRole:
-    Type: AWS::IAM::Role
-    Properties:
-      AssumeRolePolicyDocument:
-        Version: "2012-10-17"
-        Statement:
-          - Effect: Allow
-            Principal: { Service: apigateway.amazonaws.com }
-            Action: sts:AssumeRole
-      ManagedPolicyArns:
-        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs
-  ApiGatewayAccount:
-    Type: AWS::ApiGateway::Account
-    Properties:
-      CloudWatchRoleArn: !GetAtt ApiGatewayCloudWatchRole.Arn
-
   OpsAlarmTopic:
     Type: AWS::SNS::Topic
     Properties:
@@ -668,7 +653,9 @@ Resources:
     Properties:
       AppId: !GetAtt AmplifyApp.AppId
       BranchName: !Ref FrontendBranch
-      EnableAutoBuild: true
+      # Builds are started by the pipeline after `sam deploy`, so the frontend
+      # always builds against the backend (and env vars) it was deployed with.
+      EnableAutoBuild: false
       Stage: !If [IsProd, PRODUCTION, DEVELOPMENT]
 
 # ---------------------------------------------------------------------------

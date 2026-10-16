@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 process.env.TABLE_NAME ??= 'test-table';
-process.env.AWS_REGION ??= 'us-east-1';
+process.env.AWS_REGION ??= 'eu-central-1';
 const { handler } = await import('../src/api/handler.js');
 
 // Shape of an API Gateway REST proxy event for the /tasks/{taskId} resource.

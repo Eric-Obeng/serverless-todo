@@ -21,7 +21,7 @@ A serverless task manager on AWS. Signed-in users manage their own tasks. Any ta
 ├── samconfig.toml                # sam build/deploy defaults (dev / prod)
 ├── amplify.yml                   # Amplify Hosting build spec (monorepo → frontend/)
 ├── .github/workflows/pipeline.yml# test → sam validate → sam build → sam deploy → Amplify build
-├── infra/github-oidc-role.yaml   # one-time: IAM role for GitHub Actions OIDC
+├── infra/bootstrap.yaml         # one-time per account: API GW logging role + GitHub OIDC deploy role
 ├── backend/
 │   ├── src/api/                  # Express app (CRUD) + Lambda adapter + local dev server
 │   │   ├── app.js  handler.js  local.js  taskRepository.js
@@ -125,69 +125,93 @@ All routes need `Authorization: <Cognito ID token>`.
 
 ## Getting started
 
+### Environments
+
+Two fully separate stacks, each with its own user pool, table, topic, API and Amplify app:
+
+| Environment | Git branch | Stack | `Stage` | Deploys when |
+|---|---|---|---|---|
+| **dev** | `develop` | `serverless-todo-dev` | `dev` | a PR is merged into `develop` |
+| **prod** | `main` | `serverless-todo-prod` | `prod` | a PR is merged into `main` |
+
+Users, tasks and SNS subscriptions don't carry over between environments. Sign up and confirm the subscription email in each one.
+
 ### Prerequisites
 - AWS account and AWS CLI v2 with credentials configured
 - AWS SAM CLI ≥ 1.120
 - Node.js 22
 
-### 1. Deploy the backend
+### 0. Bootstrap the account (once)
+
+`infra/bootstrap.yaml` holds what dev and prod share: API Gateway's CloudWatch Logs role (one per account and region) and the IAM role GitHub Actions uses to deploy. Deploy it **before** any app stack, because API logging fails without that role.
+
+```bash
+aws cloudformation deploy --template-file infra/bootstrap.yaml \
+  --stack-name serverless-todo-bootstrap --capabilities CAPABILITY_NAMED_IAM \
+  --parameter-overrides GitHubOrg=<owner> GitHubRepo=<repo>
+```
+
+> **Upgrading a dev stack created before this file existed:** that stack created its own API Gateway logging role. Deploy the bootstrap stack **first**, then update dev. Dev then removes its old copy, and the account setting already points at the bootstrap role.
+
+### 1. Deploy the backend manually (optional, the pipeline does this)
 
 ```bash
 cd backend && npm ci && cd ..
 export PATH="$PWD/backend/node_modules/.bin:$PATH"   # sam build needs esbuild (or: npm i -g esbuild)
 sam build
-sam deploy --guided        # first time; later runs just use: sam deploy
+
+# dev
+sam deploy --parameter-overrides Stage=dev FrontendBranch=develop \
+  FrontendRepositoryUrl=https://github.com/<you>/<repo>
+
+# prod
+sam deploy --config-env prod --parameter-overrides Stage=prod FrontendBranch=main \
+  FrontendRepositoryUrl=https://github.com/<you>/<repo>
 ```
 
-`FrontendRepositoryUrl` can stay empty on the first deploy if you only want the backend. The stack outputs include `ApiUrl`, `UserPoolId`, `UserPoolClientId` and `Region`.
+`--parameter-overrides` on the command line replaces the values saved in `samconfig.toml`, so add `AlarmEmail=<you@example.com>` if you want it. Leave `FrontendRepositoryUrl` out to deploy only the backend. Each stack's outputs include `ApiUrl`, `UserPoolId`, `UserPoolClientId` and `Region`.
 
 ### 2. Run the frontend locally
 
 ```bash
 cd frontend
-cp .env.example .env.local   # fill from the stack outputs
+cp .env.example .env.local   # fill from the dev stack outputs
 npm ci && npm run dev        # http://localhost:5173
 ```
 
 ### 3. Host the frontend on Amplify (all in SAM)
 
-1. Create a GitHub fine-grained PAT with read access to **Contents** and **Webhooks** on the repo. Store it as a plain-text secret:
-   ```bash
-   aws secretsmanager create-secret --name serverless-todo/github-token --secret-string '<PAT>'
-   ```
-2. Deploy with the repo URL:
-   ```bash
-   sam deploy --parameter-overrides Stage=dev FrontendRepositoryUrl=https://github.com/<you>/<repo>
-   ```
-3. Start the first build, since a branch created by CloudFormation doesn't build on its own. The pipeline does this step for you.
-   ```bash
-   aws amplify start-job --app-id <AmplifyAppId> --branch-name main --job-type RELEASE
-   ```
+Create a GitHub fine-grained PAT with read access to **Contents** and **Webhooks** on the repo. Store it once as a plain-text secret, which both environments use:
 
-The template sets `VITE_USER_POOL_ID`, `VITE_USER_POOL_CLIENT_ID`, `VITE_API_URL` and `VITE_AWS_REGION` as Amplify environment variables. `frontend/src/amplifyConfig.js` reads them to register Cognito and the REST API with `Amplify.configure`.
+```bash
+aws secretsmanager create-secret --name serverless-todo/github-token --secret-string '<PAT>'
+```
+
+When `FrontendRepositoryUrl` is set, each stack creates its own Amplify app connected to its own branch (`develop` or `main`). Amplify's auto-build is **off**. The pipeline starts a build after `sam deploy`, so the frontend always builds against the backend it was deployed with. After a manual deploy, start the build yourself:
+
+```bash
+aws amplify start-job --app-id <AmplifyAppId> --branch-name <develop|main> --job-type RELEASE
+```
+
+The template sets `VITE_USER_POOL_ID`, `VITE_USER_POOL_CLIENT_ID`, `VITE_API_URL` and `VITE_AWS_REGION` as Amplify environment variables. `frontend/src/amplifyConfig.js` reads them to register Cognito and the REST API with `Amplify.configure`. The app URL is the `AmplifyAppUrl` stack output.
 
 > If the frontend has its own repo, set `FrontendAppRoot=.` and move `amplify.yml` into that repo. Change `appRoot` in that file to match.
 
 ### 4. CI/CD pipeline (GitHub Actions)
 
-```bash
-aws cloudformation deploy --template-file infra/github-oidc-role.yaml \
-  --stack-name serverless-todo-github-oidc --capabilities CAPABILITY_NAMED_IAM \
-  --parameter-overrides GitHubOrg=<owner> GitHubRepo=<repo>
-```
+After step 0, set up the GitHub repo:
+- **Secret** `AWS_DEPLOY_ROLE_ARN`: the `DeployRoleArn` output of `serverless-todo-bootstrap`
+- **Environments** (Settings → Environments): create `dev` and `prod`. For `prod`, you can add *Required reviewers* or limit *Deployment branches* to `main`.
+- **Optional variables:** `AWS_REGION` (default `eu-central-1`), `ALARM_EMAIL`
 
-In the GitHub repo settings:
-- Secret `AWS_DEPLOY_ROLE_ARN`: the `DeployRoleArn` output from the stack above
-- Optional variables: `AWS_REGION`, `STACK_NAME`, `ALARM_EMAIL`
-
-Every push to `main` then runs unit tests → frontend build → `sam validate --lint` → `sam build` → `sam deploy` → Amplify release job.
+Every push or PR to `develop` or `main` runs the unit tests, the frontend build and `sam validate --lint`. A merge then deploys that branch's environment: `sam build` → `sam deploy` → Amplify release job.
 
 ### Branching
 
-`main` is protected: it only changes through pull requests, and only `main` deploys.
+`main` is protected and only changes through pull requests. Changes reach prod by going through dev first.
 
 ```
-feature/<name> ──PR──▶ develop ──PR──▶ main ──▶ sam deploy + Amplify release
+feature/<name> ──PR──▶ develop ──▶ deploy dev ──PR──▶ main ──▶ deploy prod
 ```
 
 ```bash
@@ -197,7 +221,7 @@ git checkout -b feature/my-change
 git push -u origin feature/my-change      # open PR into develop
 ```
 
-When `develop` is ready to release, open a PR `develop → main`. The `test` job must pass before it can merge.
+When dev looks good, open a PR `develop → main`. The `test` job must pass before it can merge.
 
 ### Local API (optional)
 
@@ -214,7 +238,7 @@ npm run dev                          # http://localhost:3001 (JWT decoded, NOT v
 4. **Update** the title or description, **complete** a second task and **delete** a third. Show their schedules disappearing, plus the StreamRouter and CancelExpiry logs in CloudWatch.
 5. Wait for the first task's deadline. Its status flips to **Expired** in the UI (the list auto-refreshes every 15 s) and the **expiry email** arrives.
 6. Show the CloudWatch dashboard `<stack>`, the alarms, the Lambda JSON logs and the X-Ray traces.
-7. Push a commit and show the GitHub Actions run deploying through SAM.
+7. Merge a PR into `develop` and show the GitHub Actions run deploying dev through SAM. Then promote it with a PR `develop → main` to deploy prod.
 
 ### Quick API test with curl
 
@@ -234,4 +258,4 @@ curl -H "Authorization: $TOKEN" -H 'Content-Type: application/json' \
 - Users only ever see their own items: the partition key comes from the verified token `sub`, never from the request.
 - SNS filter policies mean each user only receives their own notifications.
 - Table, queues and topics use encryption at rest. DynamoDB has PITR on.
-- `infra/github-oidc-role.yaml` uses `AdministratorAccess` to keep the lab simple. Scope it down for real use.
+- The GitHub deploy role in `infra/bootstrap.yaml` uses `AdministratorAccess` to keep the lab simple. Scope it down for real use.
