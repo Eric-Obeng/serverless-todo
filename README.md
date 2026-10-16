@@ -47,9 +47,11 @@ A serverless task manager on AWS. Signed-in users manage their own tasks. Any ta
 
 ## Architecture
 
-![Architecture](docs/architecture/architecture.png)
+![Architecture](docs/architecture/architecture-drawio.png)
 
-The diagram is generated from code, [`docs/architecture/diagram.py`](docs/architecture/diagram.py). The numbers and letters on its arrows match the walkthrough below. Dev and prod are two identical, isolated copies of the "per-environment stack" in the account's `eu-central-1` region.
+The main diagram is a draw.io file using the official AWS icon set: [`docs/architecture/architecture.drawio`](docs/architecture/architecture.drawio). Open it in [diagrams.net](https://app.diagrams.net) or the draw.io desktop app / VS Code extension to edit it, then export it to `architecture-drawio.png`. A diagram-as-code version of the same architecture is in [`diagram.py`](docs/architecture/diagram.py), which renders [`architecture.png`](docs/architecture/architecture.png).
+
+Both diagrams use the same numbers and letters on their arrows, which match the walkthrough below. Dev and prod are two identical, isolated copies of the "Application stack" in the account's `eu-central-1` region.
 
 **Request path (blue)**
 
