@@ -1,8 +1,10 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >
-  One-time bootstrap: IAM role GitHub Actions assumes via OIDC to deploy the SAM stack.
-  aws cloudformation deploy --template-file infra/github-oidc-role.yaml \
-    --stack-name serverless-todo-github-oidc --capabilities CAPABILITY_NAMED_IAM \
+  One-time, account+region-level bootstrap shared by the dev and prod app stacks:
+  (1) API Gateway's CloudWatch Logs role (an account-wide setting), and
+  (2) the IAM role GitHub Actions assumes via OIDC to deploy.
+  aws cloudformation deploy --template-file infra/bootstrap.yaml \
+    --stack-name serverless-todo-bootstrap --capabilities CAPABILITY_NAMED_IAM \
     --parameter-overrides GitHubOrg=<owner> GitHubRepo=<repo>
 
 Parameters:
@@ -20,6 +22,24 @@ Conditions:
   CreateProvider: !Equals [!Ref CreateOidcProvider, "true"]
 
 Resources:
+  # API Gateway pushes execution/access logs using ONE role per account+region.
+  # Kept here (not in template.yaml) so deleting dev can never break prod logging.
+  ApiGatewayCloudWatchRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: apigateway.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs
+  ApiGatewayAccount:
+    Type: AWS::ApiGateway::Account
+    Properties:
+      CloudWatchRoleArn: !GetAtt ApiGatewayCloudWatchRole.Arn
+
   GitHubOidcProvider:
     Type: AWS::IAM::OIDCProvider
     Condition: CreateProvider

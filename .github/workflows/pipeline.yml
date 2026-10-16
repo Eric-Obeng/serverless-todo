@@ -2,7 +2,9 @@ name: SAM pipeline
 
 # Branch flow: feature/* -> PR -> develop -> PR -> main (protected).
 # Every push/PR to develop or main runs the `test` job (use it as the required
-# status check); only main deploys.
+# status check). Merges deploy:
+#   develop -> stack serverless-todo-dev  (Stage=dev,  Amplify branch develop)
+#   main    -> stack serverless-todo-prod (Stage=prod, Amplify branch main)
 on:
   push:
     branches: [main, develop]
@@ -19,7 +21,6 @@ concurrency:
 
 env:
   AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
-  STACK_NAME: ${{ vars.STACK_NAME || 'serverless-todo-dev' }}
 
 jobs:
   test:
@@ -52,11 +53,18 @@ jobs:
 
   deploy:
     needs: test
-    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    if: >-
+      (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop') &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
-    environment: dev
+    # GitHub environment per stage: add protection rules / env-specific vars there.
+    environment: ${{ github.ref_name == 'main' && 'prod' || 'dev' }}
+    env:
+      STAGE: ${{ github.ref_name == 'main' && 'prod' || 'dev' }}
+      STACK_NAME: serverless-todo-${{ github.ref_name == 'main' && 'prod' || 'dev' }}
+      BRANCH: ${{ github.ref_name }}
     permissions:
-      id-token: write # GitHub OIDC -> AWS IAM role (see infra/github-oidc-role.yaml)
+      id-token: write # GitHub OIDC -> AWS IAM role (see infra/bootstrap.yaml)
       contents: read
     steps:
       - uses: actions/checkout@v4
@@ -84,21 +92,22 @@ jobs:
         run: |
           sam deploy \
             --stack-name "$STACK_NAME" \
+            --s3-prefix "$STACK_NAME" \
             --region "$AWS_REGION" \
             --no-confirm-changeset \
             --no-fail-on-empty-changeset \
             --parameter-overrides \
-              Stage=dev \
+              Stage="$STAGE" \
               FrontendRepositoryUrl="${{ github.server_url }}/${{ github.repository }}" \
-              FrontendBranch=main \
+              FrontendBranch="$BRANCH" \
               AlarmEmail="${{ vars.ALARM_EMAIL }}"
 
-      - name: Trigger Amplify build (picks up latest env vars)
+      - name: Build frontend on Amplify (after backend, with its env vars)
         run: |
           APP_ID=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
             --query "Stacks[0].Outputs[?OutputKey=='AmplifyAppId'].OutputValue" --output text)
           if [ -n "$APP_ID" ] && [ "$APP_ID" != "None" ]; then
-            aws amplify start-job --app-id "$APP_ID" --branch-name main --job-type RELEASE
+            aws amplify start-job --app-id "$APP_ID" --branch-name "$BRANCH" --job-type RELEASE
           fi
 
       - name: Stack outputs
